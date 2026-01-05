@@ -32,24 +32,133 @@ local function construct_neotest_status(test_result)
   return test_result.status
 end
 
+--- Aggressively reconstructs JSON from corrupted/truncated output
+---@param lines string[]
+---@return string[]
+local function reconstruct_json_lines(lines)
+  -- Concatenate everything first - this handles severe truncation
+  local full_text = table.concat(lines, '')
+
+  local reconstructed = {}
+  local i = 1
+
+  while i <= #full_text do
+    -- Find start of next JSON object
+    local start = full_text:find('{', i, true)
+    if not start then
+      break
+    end
+
+    -- Extract complete JSON by tracking brace depth
+    local brace_count = 0
+    local in_string = false
+    local escape_next = false
+    local obj_end = nil
+
+    for j = start, #full_text do
+      local char = full_text:sub(j, j)
+
+      if escape_next then
+        escape_next = false
+      elseif char == '\\' and in_string then
+        escape_next = true
+      elseif char == '"' then
+        in_string = not in_string
+      elseif not in_string then
+        if char == '{' then
+          brace_count = brace_count + 1
+        elseif char == '}' then
+          brace_count = brace_count - 1
+          if brace_count == 0 then
+            obj_end = j
+            break
+          end
+        end
+      end
+    end
+
+    if obj_end then
+      local json_str = full_text:sub(start, obj_end)
+      -- Validate it's parseable JSON
+      local ok, parsed = pcall(vim.json.decode, json_str, { luanil = { object = true } })
+      if ok then
+        table.insert(reconstructed, json_str)
+      end
+      i = obj_end + 1
+    else
+      -- Couldn't find closing brace, skip this opening brace
+      i = start + 1
+    end
+  end
+
+  return reconstructed
+end
+
 --- Collects test output to single table where test information is accessible
---- by test name
+--- by test name. Handles severely corrupted/truncated output.
 ---@param lines string[]
 ---@return table, table
 local function marshal_test_results(lines)
   local tests = {}
   local parsed_jsons = {}
   local unparsable_lines = {}
-  for _, line in ipairs(lines) do
+
+  -- Reconstruct JSON from potentially corrupted output
+  local json_lines = reconstruct_json_lines(lines)
+
+  -- Parse each reconstructed JSON and deduplicate
+  local seen_objects = {}
+
+  for _, line in ipairs(json_lines) do
     if line ~= '' then
       local ok, parsed = pcall(vim.json.decode, line, { luanil = { object = true } })
       if ok then
-        table.insert(parsed_jsons, parsed)
-      else
-        table.insert(unparsable_lines, line)
+        -- Create unique fingerprint for deduplication
+        local fingerprint = nil
+
+        if parsed.testID and parsed.type then
+          -- For test results, use testID + type + result
+          fingerprint = string.format(
+            'testID:%d:type:%s:result:%s:time:%s',
+            parsed.testID,
+            parsed.type,
+            parsed.result or 'none',
+            parsed.time or 0
+          )
+        elseif parsed.test and parsed.test.id then
+          -- For test definitions, use test id + name
+          fingerprint = string.format('test:id:%d:name:%s', parsed.test.id, parsed.test.name or '')
+        elseif parsed.group and parsed.group.id then
+          -- For groups, use group id
+          fingerprint =
+            string.format('group:id:%d:name:%s', parsed.group.id, parsed.group.name or '')
+        elseif parsed.suite and parsed.suite.id ~= nil then
+          -- For suites, use suite id
+          fingerprint = string.format('suite:id:%d', parsed.suite.id)
+        elseif parsed.type == 'allSuites' or parsed.type == 'done' or parsed.type == 'start' then
+          -- For events, use type + time
+          fingerprint = string.format('event:%s:%d', parsed.type, parsed.time or 0)
+        end
+
+        -- Only add if we haven't seen this exact object before
+        if fingerprint and not seen_objects[fingerprint] then
+          seen_objects[fingerprint] = true
+          table.insert(parsed_jsons, parsed)
+        elseif not fingerprint then
+          -- If we can't create a fingerprint, add it anyway (rare edge case)
+          table.insert(parsed_jsons, parsed)
+        end
       end
     end
   end
+
+  -- Collect any non-JSON content as unparsable
+  for _, line in ipairs(lines) do
+    if line ~= '' and not line:match('^%s*{') and not line:match('}%s*$') then
+      table.insert(unparsable_lines, line)
+    end
+  end
+
   local test_names_by_ids = get_test_names_by_ids(parsed_jsons)
 
   for _, json in ipairs(parsed_jsons) do
@@ -85,7 +194,7 @@ local function highlight_as_error(message)
   if message == nil then
     return nil
   end
-  return message:gsub('^', '[31m'):gsub('$', '[0m')
+  return message:gsub('^', '[31m'):gsub('$', '[0m')
 end
 
 ---@returns string formated duration

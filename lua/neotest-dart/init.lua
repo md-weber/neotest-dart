@@ -36,6 +36,11 @@ local function on_outline_changed(data)
   end
 end
 
+--- Check if command is very_good CLI
+local function is_very_good_command()
+  return command:find('very_good') ~= nil
+end
+
 ---@async
 ---@return neotest.Tree| nil
 function adapter.discover_positions(path)
@@ -89,7 +94,11 @@ local function construct_test_argument(position, strategy)
       table.insert(test_argument, '"' .. test_name .. '"')
     end
   end
-  table.insert(test_argument, '--no-pub')
+  -- Only add --no-pub flag if not using very_good CLI
+  -- very_good CLI automatically runs without pub get
+  if not is_very_good_command() then
+    table.insert(test_argument, '--no-pub')
+  end
   return test_argument
 end
 
@@ -144,13 +153,61 @@ function adapter.build_spec(args)
   local position = tree:data()
 
   local command_parts = {}
+  local use_very_good = is_very_good_command()
 
   if position.type == 'dir' then
     if string.sub(position.path, -#'/test') == '/test' then
+      if use_very_good then
+        command_parts = {
+          command,
+          'test',
+          position.path,
+          '--',
+          '--reporter',
+          'json',
+        }
+      else
+        command_parts = {
+          command,
+          'test',
+          position.path,
+          '--reporter',
+          'json',
+        }
+      end
+    else
+      if use_very_good then
+        command_parts = {
+          command,
+          'test',
+          string.format('%s/%s', position.path, 'test'),
+          '--',
+          '--reporter',
+          'json',
+        }
+      else
+        command_parts = {
+          command,
+          'test',
+          string.format('%s/%s', position.path, 'test'),
+          '--reporter',
+          'json',
+        }
+      end
+    end
+  end
+
+  local test_argument = construct_test_argument(position, args.strategy)
+
+  if position.type == 'test' or position.type == 'file' or position.type == 'namespace' then
+    if use_very_good then
+      -- For very_good CLI, use -- to pass flags to underlying flutter/dart test
       command_parts = {
         command,
         'test',
         position.path,
+        '--',
+        test_argument,
         '--reporter',
         'json',
       }
@@ -158,24 +215,12 @@ function adapter.build_spec(args)
       command_parts = {
         command,
         'test',
-        string.format('%s/%s', position.path, 'test'),
+        position.path,
+        test_argument,
         '--reporter',
         'json',
       }
     end
-  end
-
-  local test_argument = construct_test_argument(position, args.strategy)
-
-  if position.type == 'test' or position.type == 'file' or position.type == 'namespace' then
-    command_parts = {
-      command,
-      'test',
-      position.path,
-      test_argument,
-      '--reporter',
-      'json',
-    }
   end
 
   local extra_args = args.extra_args or {}
